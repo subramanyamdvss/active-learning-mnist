@@ -4,6 +4,7 @@ require 'optim'
 require 'nn'
 require 'xlua'
 require 'image'
+require 'paths'
 
 ---------------------DEFINING OPTIONS------------------
 opt = lapp[[
@@ -24,7 +25,7 @@ opt = lapp[[
    --weightDecay              (default 0.0005)      weightDecay
    -m,--momentum              (default 0.9)         momentum
    --epoch_step               (default 25)          epoch step
-   --epochs                   (3000)                no. of epochs
+   --epochs                   (default 3000)                no. of epochs
    --spiltval                 (default 50000)       spilt size to train ndf or start episode
     
    --backend                  (default cudnn)            backend
@@ -49,7 +50,7 @@ opt = lapp[[
 
 -------------------default tensor type-------------------------------------------------------------
 
-torch.setdefaulttensortype('torch.CudaTensor')
+-- torch.setdefaulttensortype('torch.CudaTensor')
 --------------------classes------------------------------------------------------------------------
 classes  =  {'0','1','2','3','4','5','6','7','8','9'}
 
@@ -66,8 +67,8 @@ local targtest = mnist.testdataset().label+1   --10000
 --for NDF the input has 12 features  10 log probabilities+ normalized iteration+ average historical training accuracy.  
 
 local ndf = nn.Sequential()
-ndf:add(nn.Linear(12,6)):add(nn.Tanh()):add(nn.Linear(6,1)):add(nn.Sigmoid())
-if filep(opt.save .. 'ndf.net') then
+ndf:add(nn.Copy('torch.DoubleTensor','torch.CudaTensor')):add(nn.Linear(12,6)):add(nn.Tanh()):add(nn.Linear(6,1)):add(nn.Sigmoid())
+if paths.filep(opt.save .. 'ndf.net') then
    ndf = torch.load(opt.save .. 'ndf.net')
 end
 
@@ -84,15 +85,15 @@ end
 --    ndf = torch.load(opt.save .. 'modelentropy.net')
 -- end
 
-local actorcritic = nn.Sequential()
-local parallel = nn.ParallelTable()
-parallel:add(nn.Identity())
-parallel:add(nn.Linear(opt.batchSize,12,true))
-actorcritic:add(parallel)
-actorcritic:add(nn.MM())
-actorcritic:add(nn.ReLU())
-actorcritic:add(nn.Linear(opt.batchSize,1))
-actorcritic:add(nn.Sigmoid())
+-- local actorcritic = nn.Sequential()
+-- local parallel = nn.ParallelTable()
+-- parallel:add(nn.Identity())
+-- parallel:add(nn.Linear(opt.batchSize,12,true))
+-- actorcritic:add(parallel)
+-- actorcritic:add(nn.MM())
+-- actorcritic:add(nn.ReLU())
+-- actorcritic:add(nn.Linear(opt.batchSize,1))
+-- actorcritic:add(nn.Sigmoid())
 
 
 
@@ -174,7 +175,7 @@ function trainNdfReinforce(L)
    for l = 1, opt.episodes do
       local filtind = nil
       local rnd = torch.randperm(L:size(1)):long()
-      pretrainsetind = pretrainsetind:index(1,rnd)
+      L = L:index(1,rnd)
       pretrainsetind = L:spilt(L:size(1)/2)[1]
       posttrainsetind = L:spilt(L:size(1)/2)[2]
       pretrainsetind = pretrainsetind:spilt(pretrainsetind:size(1)-opt.ndfval)
@@ -187,7 +188,7 @@ function trainNdfReinforce(L)
       baseline = 0.8*baseline + 0.2*reward
       local unlabeledstates = nil
       local T = 0
-      while ~stop do
+      while not stop do
          T = T+1
          if modifiedtrain:size(1)/(L:size()-opt.ndfval) >= 0.98 then
             stop = true
@@ -202,12 +203,12 @@ function trainNdfReinforce(L)
          trainacc:fill(confusion.totalValid)
          local expprobs = logprobs:exp()
          local expprobs,ind = torch.sort(2,expprobs)
-         margin[{},{1}] = expprobs[{},{-1}]-expprobs[{},{-2}]
-         entropy[{},{1}] = torch.sum(-torch.cmul(logprobs,logprobs:exp()),2)
-         valacc[{},{1}]:fill(reward)
+         margin[{{},{1}}] = expprobs[{{},{-1}}]-expprobs[{{},{-2}}]
+         entropy[{{},{1}}] = torch.sum(-torch.cmul(logprobs,logprobs:exp()),2)
+         valacc[{{},{1}}]:fill(reward)
          states = getstate()
          ndfoutputs = ndf:forward(states)
-         if ~unlabeledstates then
+         if not unlabeledstates then
             unlabeledstates = states
          else
             unlabeledstates = torch.cat(unlabeledstates,states)
@@ -273,7 +274,7 @@ end
 --this function takes train dataset, validation dataset and outputs the validation accuracy.
 function trainModel(L,Lval)
    local model = nn.Sequential()
-   model:add(nn.Linear(784,500)):add(nn.Tanh()):add(nn.Linear(500,10)):add(nn.LogSoftMax())
+   model:add(nn.Copy('torch.DoubleTensor','torch.CudaTensor')):add(nn.Linear(784,500)):add(nn.Tanh()):add(nn.Linear(500,10)):add(nn.LogSoftMax())
    weightinitm(model)
    local parameters,gradParameters = model:getParameters()
    local epochs = math.floor(L:size(1)/trainset:size(1)*500)
@@ -282,7 +283,7 @@ function trainModel(L,Lval)
    for ep = 1,epochs do
       local shuffle = torch.randperm(L:size(1)):long()
       L = L:index(1,shuffle):long():spilt(batchSize)
-      for i = 1 to shuffle:size(1)-1 do
+      for i = 1 , shuffle:size(1)-1 do
          local batch = trainset:index(1,L[i])
          local targets = targtrain:index(1,L[i])
          local feval = function(x)
@@ -318,9 +319,9 @@ end
 function train() 
    local filtind = nil
    local rnd = torch.randperm(trainset:size(1)):long()
-   pretrainsetind = pretrainsetind:index(1,rnd)
-   pretrainsetind = L:spilt(L:size(1)/2)[1]
-   posttrainsetind = L:spilt(L:size(1)/2)[2]
+   trainset = trainset:index(1,rnd)
+   pretrainsetind = rnd:spilt(trainset:size(1)/2)[1]
+   posttrainsetind = rnd:spilt(trainset:size(1)/2)[2]
    pretrainsetind = pretrainsetind:spilt(pretrainsetind:size(1)-opt.trainval)
    prevalset = pretrainsetind[2]
    pretrainsetind = pretrainsetind[1]
@@ -331,7 +332,7 @@ function train()
    trainNdfReinforce(modifiedtrain)
    local unlabeledstates = nil
    local T = 0
-   while ~stop do
+   while not stop do
       T = T+1
       if modifiedtrain:size(1)/(trainset:size()-opt.trainval) >= 0.98 then
          stop = true
@@ -346,12 +347,12 @@ function train()
       trainacc:fill(confusion.totalValid)
       local expprobs = logprobs:exp()
       local expprobs,ind = torch.sort(2,expprobs)
-      margin[{},{1}] = expprobs[{},{-1}]-expprobs[{},{-2}]
-      entropy[{},{1}] = torch.sum(-torch.cmul(logprobs,logprobs:exp()),2)
-      valacc[{},{1}]:fill(reward)
+      margin[{{},{1}}] = expprobs[{{},{-1}}]-expprobs[{{},{-2}}]
+      entropy[{{},{1}}] = torch.sum(-torch.cmul(logprobs,logprobs:exp()),2)
+      valacc[{{},{1}}]:fill(reward)
       states = getstate()
       ndfoutputs = ndf:forward(states)
-      if ~unlabeledstates then
+      if not unlabeledstates then
          unlabeledstates = states
       else
          unlabeledstates = torch.cat(unlabeledstates,states)
