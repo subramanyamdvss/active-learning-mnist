@@ -69,11 +69,11 @@ if filep(opt.save .. 'ndf.net') then
 end
 
    
-local model = nn.Sequential()
-ndf:add(nn.Linear(784,500)):add(nn.Tanh()):add(nn.Linear(500,10)):add(nn.LogSoftMax())
-if filep(opt.save .. 'model.net') then
-   ndf = torch.load(opt.save .. 'model.net')
-end
+-- local model = nn.Sequential()
+-- ndf:add(nn.Linear(784,500)):add(nn.Tanh()):add(nn.Linear(500,10)):add(nn.LogSoftMax())
+-- if filep(opt.save .. 'model.net') then
+--    ndf = torch.load(opt.save .. 'model.net')
+-- end
  
 -- local modelentropy = nn.Sequential()
 -- ndf:add(nn.Linear(784,500)):add(nn.Tanh()):add(nn.Linear(500,10)):add(nn.LogSoftMax())
@@ -106,6 +106,7 @@ local normalizediter = torch.Tensor(opt.activebatchSize,1):fill(0)
 local trainacc = torch.Tensor(opt.activebatchSize,1):fill(0)
 local margin = torch.Tensor(opt.activebatchSize,1):fill(0)
 local entropy = torch.Tensor(opt.activebatchSize,1):fill(0)
+local valacc = torch.Tensor(opt.activebatchSize,1):fill(0)
 function getstate()
    return torch.cat(logprobs,normalizediter,trainacc,2)
 end
@@ -117,6 +118,13 @@ function weightinit(model)
       if k == 2 then
          v.bias:fill(2)
       end
+      v.weight:normal(0,0.1)
+   end
+end
+function weightinitm(model) 
+   for k,v in pairs(model:findModules('nn.Linear')) do
+      print({v})
+      v.bias:fill(0)
       v.weight:normal(0,0.1)
    end
 end
@@ -143,26 +151,146 @@ end
 --Algorithm for training datafilter
 -- L-initial-ndf = 15k 
 -- for t = 1 to ndf.episodes: 
+--     shuffle L and then partition pretrain, val and posttrain dataset.
 --     for  i = 1 to ndf.T :
---         --when should I stop this iteration? when I reached 
---         for each iteration you have to train a new model to fit a new labeled set L
---         then select some unlabeled instances(around 200/1000)(by 200 I mean 200 new instances) to label using NDF.
+--         select some unlabeled instances(around 200) to label using NDF.
+--         if the filtered batch is less than 200 then don't update the model until 200 instances arrive. 
 --         and add it to the current labeled set, L = L U L'
+--         for each iteration you have to train a new model to fit a new labeled set L
+--         get the reward and update the ndf.
 
 
---this function has inputs:  L : the labeled set among which half shall be used for pretraining the model and half shall 
+
+--this function has inputs: L : the labeled set among which half shall be used for pretraining the model and half shall 
 --be used for labeling.
 
-function trainNdf(L)
-   pretrainsetind = L:spilt(L:size(1)/2)[1]
-   posttrainsetind = L:spilt(L:size(1)/2)[2]
-
+function trainNdfReinforce(L)
+   local model = nil
+   local baseline = 0
+   local reward = 0
+   for l = 1, opt.episodes do
+      local filtind = nil
+      local rnd = torch.randperm(L:size(1)):long()
+      pretrainsetind = pretrainsetind:index(1,rnd)
+      pretrainsetind = L:spilt(L:size(1)/2)[1]
+      posttrainsetind = L:spilt(L:size(1)/2)[2]
+      pretrainsetind = pretrainsetind:spilt(pretrainsetind:size(1)-2000)
+      prevalset = pretrainsetind[2]
+      pretrainsetind = pretrainsetind[1]
+      unlabeledpool = posttrainsetind
+      unlabeledpool = unlabeledpool:split(opt.activebatchSize)
+      local modifiedtrain = pretrainsetind
+      local stop = false
+      model,reward,confusion = trainModel(modifiedtrain,prevalset)
+      baseline = 0.8*baseline + 0.2*reward
+      local unlabeledstates = nil
+      for t = 1,(#unlabeledpool)-1 do
+         local activebatch = unlabeledpool[t]
+         --find the states needed for activebatch
+         --update state variables
+         logprobs = torch.log(model:forward(activebatch))
+         normalizediter:fill(1)
+         trainacc:fill(confusion.totalValid)
+         local expprobs = logprobs:exp()
+         local expprobs,ind = torch.sort(2,expprobs)
+         margin[{},{1}] = expprobs[{},{-1}]-expprobs[{},{-2}]
+         entropy[{},{1}] = torch.sum(-torch.cmul(logprobs,logprobs:exp()),2)
+         valacc[{},{1}]:fill(reward)
+         states = getstate()
+         ndfoutputs = ndf:forward(states)
+         if ~unlabeledstates then
+            unlabeledstates = states
+         else
+            unlabeledstates = torch.cat(unlabeledstates,states)
+         end
+         --filter the batch.
+         local filter = torch.ge(ndfoutputs,0.5)
+         local num = torch.sum(filter)
+         local indx = torch.CudaLongTensor(num)
+         local j = 0;
+         for i = 1,opt.activebatchSize do
+            if filter[i] == 1 then
+               j = j + 1
+               indx[j] = i
+            end
+         end
+         collectgarbage()
+         if filtind then
+            filtind = torch.cat(filtind,indx)
+         else
+            filtind = indx
+         end
+         --if filtered batch has length less than opt.activebatchSize then do not train else add it to the training set and start training.
+         if filtind:size(1)>=opt.activebatchSize() then
+            local batch = filtind:spilt(opt.activebatchSize)[1]
+            filtind = filtind:spilt(opt.activebatchSize)[2]
+            modifiedtrain = torch.cat(modifiedtrain,batch)
+            confusion:zero()
+            model,reward,confusion = trainModel(modifiedtrain,prevalset)
+         end
+      end
+      --now train the ndf by using unlabeled states.
+      unlabeledstates = unlabeledstates:split(opt.activebatchSize)
+      for t = 1,(#unlabeledstates) do
+         local parametersn,gradParametersn = ndf:getParameters()
+         local ndfeval =  function(x) 
+            if x ~= parametersn then parametersn:copy(x) end
+            gradParametersn:zero()
+            local outputs = ndf:forward(unlabeledstates[t])
+            local targets = torch.ge(ndfprobs,0.5)
+            f = criteriondf:forward(outputs,targets)
+            df_do = criteriondf:backward(outputs,targets)
+            ndf:backward(unlabeledstates[t],(reward-baseline)*df_do)
+            return f,gradParametersn
+         end
+         optim.adam(ndfeval,parametersn)
+      end
+   end
 end
 
 
 ---------------------- trainModel function ------------------------------------------------------------------
 --this function takes train dataset, validation dataset and outputs the validation accuracy.
 function trainModel(L,Lval)
-
-
+   local model = nn.Sequential()
+   model:add(nn.Linear(784,500)):add(nn.Tanh()):add(nn.Linear(500,10)):add(nn.LogSoftMax())
+   weightinitm(model)
+   local parameters,gradParameters = model:getParameters()
+   local epochs = math.floor(L:size(1)/trainset:size(1)*500)
+   local batchSize = 128
+   local reward = 0
+   for ep = 1,epochs do
+      local shuffle = torch.randperm(L:size(1)):long():spilt(batchSize)
+      for i = 1 to shuffle:size(1)-1 do
+         local batch = trainset:index(1,shuffle[i])
+         local targets = targtrain:index(1,shuffle[i])
+         local feval = function(x)
+            if x ~= parameters then parameters:copy(x) end
+            gradParameters:zero()
+            local outputs = model:forward(batch)
+            f = criterion:forward(outputs, targets)
+            local df_do = criterion:backward(outputs, targets)
+            model:backward(inputs, df_do)
+            confusion:batchAdd(outputs, targets)
+            return f,gradParameters
+         end
+         optim.adam(feval,parameters)
+      end
+      -- if ep%5 == 0 then
+      --    reward = testdev(trainset:index(1,Lval),targtrain:index(1,Lval))
+      -- end
+   end
+   reward = testdev(trainset:index(1,Lval),targtrain:index(1,Lval))
+   return model,reward,confusion
 end
+
+------------------------------------------------final train function-------------------------------------------------
+--Algorithm for active learning
+--L-initial-train = 30k
+-- ->for  i = 1 to model.T :
+--     for each iteration you have to train a new model to fit a new labeled set L
+--     then select some unlabeled instances(around 1000/2000) to label using NDF.
+--     and add it to the current labeled set, L = L U L' (Notice the letter U, it means union thus the increase in the L may not be size(L'))
+--     shuffle before sending in the L to train_ndf()
+--     For every 10k addition to the training set during training you need to update NDF.
+
