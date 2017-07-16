@@ -10,12 +10,15 @@ opt = lapp[[
    -s,--save                  (default "logs/")      subdirectory to save logs
    -b,--batchSize             (default 128)          batch size
    -r,--learningRate          (default 1)       learning rate(not much used)
-   --activebatchSize           (default 1000)     batch size from which we filter 200 examples
+   --activebatchSize           (default 200)     batch size from which we filter 200 examples
+   --trainval                   (default 5000)   validation set size to measure generalization in train function
+   --ndfval                     (default 2000)   validation set size to measure generalization in ndf      
+   --ndfinterval                (default 10000)  after 10000 additions to labeled dataset ndf starts retraining.
    --alpha                     (default 0.001)   learning rate for the ndf(not much used)
    --gamma                     (default 0.95)      gamma used to find the cumulative reward
    --beta                     (default 0.001)      learning rate for actorcritic(not much used)
    --episodes                  (default 500)       maximum number of episodes
-   --maxiter                  (default 3000)      maximum number of iterations in an episode
+   --maxiter                  (default 1500)      maximum number of iterations in an episode
    --tou                      (default 0.8)       accuracy threshold
    --learningRateDecay        (default 1e-7)      learning rate decay
    --weightDecay              (default 0.0005)      weightDecay
@@ -174,22 +177,28 @@ function trainNdfReinforce(L)
       pretrainsetind = pretrainsetind:index(1,rnd)
       pretrainsetind = L:spilt(L:size(1)/2)[1]
       posttrainsetind = L:spilt(L:size(1)/2)[2]
-      pretrainsetind = pretrainsetind:spilt(pretrainsetind:size(1)-2000)
+      pretrainsetind = pretrainsetind:spilt(pretrainsetind:size(1)-opt.ndfval)
       prevalset = pretrainsetind[2]
       pretrainsetind = pretrainsetind[1]
       unlabeledpool = posttrainsetind
-      unlabeledpool = unlabeledpool:split(opt.activebatchSize)
       local modifiedtrain = pretrainsetind
       local stop = false
       model,reward,confusion = trainModel(modifiedtrain,prevalset)
       baseline = 0.8*baseline + 0.2*reward
       local unlabeledstates = nil
-      for t = 1,(#unlabeledpool)-1 do
-         local activebatch = unlabeledpool[t]
+      local T = 0
+      while ~stop do
+         T = T+1
+         if modifiedtrain:size(1)/(L:size()-opt.ndfval) >= 0.98 then
+            stop = true
+         end
+         local activebatch = unlabeledpool:split(unlabeledpool:size(1)-opt.activebatchSize)
+         unlabeledpool = activebatch[1]
+         activebatch = activebatch[2]
          --find the states needed for activebatch
          --update state variables
          logprobs = torch.log(model:forward(activebatch))
-         normalizediter:fill(1)
+         normalizediter:fill(T/opt.maxiter)
          trainacc:fill(confusion.totalValid)
          local expprobs = logprobs:exp()
          local expprobs,ind = torch.sort(2,expprobs)
@@ -205,13 +214,23 @@ function trainNdfReinforce(L)
          end
          --filter the batch.
          local filter = torch.ge(ndfoutputs,0.5)
+         local oppfilter = torch.lt(ndfoutputs,0.5)
+         local oppnum = torch.sum(oppfilter)
          local num = torch.sum(filter)
          local indx = torch.CudaLongTensor(num)
+         local oppindx = torch.CudaLongTensor(oppnum)
          local j = 0;
          for i = 1,opt.activebatchSize do
             if filter[i] == 1 then
                j = j + 1
                indx[j] = i
+            end
+         end
+         local j = 0;
+         for i = 1,opt.activebatchSize do
+            if oppfilter[i] == 1 then
+               j = j + 1
+               oppindx[j] = i
             end
          end
          collectgarbage()
@@ -221,10 +240,11 @@ function trainNdfReinforce(L)
             filtind = indx
          end
          --if filtered batch has length less than opt.activebatchSize then do not train else add it to the training set and start training.
-         if filtind:size(1)>=opt.activebatchSize() then
+         if filtind:size(1)>=opt.activebatchSize then
             local batch = filtind:spilt(opt.activebatchSize)[1]
             filtind = filtind:spilt(opt.activebatchSize)[2]
             modifiedtrain = torch.cat(modifiedtrain,batch)
+            unlabeledpool = torch.cat(unlabeledpool,oppindx)
             confusion:zero()
             model,reward,confusion = trainModel(modifiedtrain,prevalset)
          end
@@ -260,10 +280,11 @@ function trainModel(L,Lval)
    local batchSize = 128
    local reward = 0
    for ep = 1,epochs do
-      local shuffle = torch.randperm(L:size(1)):long():spilt(batchSize)
+      local shuffle = torch.randperm(L:size(1)):long()
+      L = L:index(1,shuffle):long():spilt(batchSize)
       for i = 1 to shuffle:size(1)-1 do
-         local batch = trainset:index(1,shuffle[i])
-         local targets = targtrain:index(1,shuffle[i])
+         local batch = trainset:index(1,L[i])
+         local targets = targtrain:index(1,L[i])
          local feval = function(x)
             if x ~= parameters then parameters:copy(x) end
             gradParameters:zero()
@@ -286,11 +307,100 @@ end
 
 ------------------------------------------------final train function-------------------------------------------------
 --Algorithm for active learning
+--train the ndf first
 --L-initial-train = 30k
 -- ->for  i = 1 to model.T :
---     for each iteration you have to train a new model to fit a new labeled set L
---     then select some unlabeled instances(around 1000/2000) to label using NDF.
+--     then select some unlabeled instances(around 200) to label using NDF.
 --     and add it to the current labeled set, L = L U L' (Notice the letter U, it means union thus the increase in the L may not be size(L'))
---     shuffle before sending in the L to train_ndf()
---     For every 10k addition to the training set during training you need to update NDF.
+--     for each iteration you have to train a new model to fit a new labeled set L
+--     For every 10k addition to the training set during training you need to update NDF.(shuffle before sending in the L to train_ndf())
+
+function train() 
+   local filtind = nil
+   local rnd = torch.randperm(trainset:size(1)):long()
+   pretrainsetind = pretrainsetind:index(1,rnd)
+   pretrainsetind = L:spilt(L:size(1)/2)[1]
+   posttrainsetind = L:spilt(L:size(1)/2)[2]
+   pretrainsetind = pretrainsetind:spilt(pretrainsetind:size(1)-opt.trainval)
+   prevalset = pretrainsetind[2]
+   pretrainsetind = pretrainsetind[1]
+   unlabeledpool = posttrainsetind
+   unlabeledpool = unlabeledpool:split(opt.activebatchSize)
+   local modifiedtrain = pretrainsetind
+   model,reward,confusion = trainModel(modifiedtrain,prevalset)
+   trainNdfReinforce(modifiedtrain)
+   local unlabeledstates = nil
+   local T = 0
+   while ~stop do
+      T = T+1
+      if modifiedtrain:size(1)/(trainset:size()-opt.trainval) >= 0.98 then
+         stop = true
+      end
+      local activebatch = unlabeledpool:split(unlabeledpool:size(1)-opt.activebatchSize)
+      unlabeledpool = activebatch[1]
+      activebatch = activebatch[2]
+      --find the states needed for activebatch
+      --update state variables
+      logprobs = torch.log(model:forward(activebatch))
+      normalizediter:fill(T/opt.maxiter)
+      trainacc:fill(confusion.totalValid)
+      local expprobs = logprobs:exp()
+      local expprobs,ind = torch.sort(2,expprobs)
+      margin[{},{1}] = expprobs[{},{-1}]-expprobs[{},{-2}]
+      entropy[{},{1}] = torch.sum(-torch.cmul(logprobs,logprobs:exp()),2)
+      valacc[{},{1}]:fill(reward)
+      states = getstate()
+      ndfoutputs = ndf:forward(states)
+      if ~unlabeledstates then
+         unlabeledstates = states
+      else
+         unlabeledstates = torch.cat(unlabeledstates,states)
+      end
+      --filter the batch.
+      local filter = torch.ge(ndfoutputs,0.5)
+      local oppfilter = torch.lt(ndfoutputs,0.5)
+      local oppnum = torch.sum(oppfilter)
+      local num = torch.sum(filter)
+      local indx = torch.CudaLongTensor(num)
+      local oppindx = torch.CudaLongTensor(oppnum)
+      local j = 0;
+      for i = 1,opt.activebatchSize do
+         if filter[i] == 1 then
+            j = j + 1
+            indx[j] = i
+         end
+      end
+      local j = 0;
+      for i = 1,opt.activebatchSize do
+         if oppfilter[i] == 1 then
+            j = j + 1
+            oppindx[j] = i
+         end
+      end
+      collectgarbage()
+      if filtind then
+         filtind = torch.cat(filtind,indx)
+      else
+         filtind = indx
+      end
+         
+
+      --if filtered batch has length less than opt.activebatchSize then do not train else add it to the training set and start training.
+      if filtind:size(1)>=opt.activebatchSize then
+         local batch = filtind:spilt(opt.activebatchSize)[1]
+         filtind = filtind:spilt(opt.activebatchSize)[2]
+         modifiedtrain = torch.cat(modifiedtrain,batch)
+         unlabeledpool = torch.cat(unlabeledpool,oppindx)
+         confusion:zero()
+         model,reward,confusion = trainModel(modifiedtrain,prevalset)
+      end
+      -- for every 10K addition to training set update ndf
+      if (modifiedtrain:size(1)-pretrainsetind:size(1))%opt.ndfinterval then
+         trainNdfReinforce(modifiedtrain)
+      end
+   end
+end
+
+-- run it up
+train()
 
