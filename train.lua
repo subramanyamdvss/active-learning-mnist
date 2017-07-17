@@ -68,7 +68,7 @@ local targtest = mnist.testdataset().label+1   --10000
 --for NDF the input has 12 features  10 log probabilities+ normalized iteration+ average historical training accuracy.  
 
 local ndf = nn.Sequential()
-ndf:add(nn.Linear(12,6)):add(nn.Tanh()):add(nn.Linear(6,1)):add(nn.Sigmoid())
+ndf:add(nn.Linear(15,8)):add(nn.Tanh()):add(nn.Linear(8,1)):add(nn.Sigmoid())
 if paths.filep(opt.save .. 'ndf.net') then
    ndf = torch.load(opt.save .. 'ndf.net')
 end
@@ -115,7 +115,7 @@ local margin = torch.Tensor(opt.activebatchSize,1):fill(0)
 local entropy = torch.Tensor(opt.activebatchSize,1):fill(0)
 local valacc = torch.Tensor(opt.activebatchSize,1):fill(0)
 function getstate()
-   return torch.cat(logprobs,normalizediter,trainacc,2)
+   return torch.cat({logprobs,normalizediter,trainacc,margin,entropy,valacc},2)
 end
 ------------------------- weight initialization functions----------------------------------------------
 function weightinit(model) 
@@ -153,7 +153,7 @@ local confusion = optim.ConfusionMatrix(10)
 -------------------------testdev function-------------------------------------------------------------
 function testdev(model,trainsetdev,targdev,batchSize)
    local conf = optim.ConfusionMatrix(10)
-   local outputs = model:forward(torch.reshape(trainsetdev,batchSize,784):cuda())
+   local outputs = model:forward(torch.reshape(trainsetdev,trainsetdev:size(1),784):cuda())
    conf:batchAdd(outputs,targdev)
    conf:updateValids()
    return conf.totalValid 
@@ -176,6 +176,7 @@ end
 --be used for labeling.
 
 function trainNdfReinforce(L)
+   print('training ndf...')
    local model = nil
    local baseline = 0
    local reward = 0
@@ -197,7 +198,7 @@ function trainNdfReinforce(L)
       local T = 0
       while not stop do
          T = T+1
-         if modifiedtrain:size(1)/(L:size()-opt.ndfval) >= 0.98 then
+         if modifiedtrain:size(1)/(L:size(1)-opt.ndfval) >= 0.98 then
             stop = true
          end
          local activebatch = unlabeledpool:split(unlabeledpool:size(1)-opt.activebatchSize)
@@ -205,56 +206,69 @@ function trainNdfReinforce(L)
          activebatch = activebatch[2]
          --find the states needed for activebatch
          --update state variables
-         logprobs = torch.log(model:forward(activebatch))
+         if activebatch:size(1) <opt.activebatchSize then
+            break
+         end
+         logprobs = torch.log(model:forward(torch.reshape(trainset:index(1,activebatch),opt.activebatchSize,784):cuda()))
+         logprobs  = logprobs:double()
          normalizediter:fill(T/opt.maxiter)
          trainacc:fill(confusion.totalValid)
          local expprobs = logprobs:exp()
-         local expprobs,ind = torch.sort(2,expprobs)
-         margin[{{},{1}}] = expprobs[{{},{-1}}]-expprobs[{{},{-2}}]
+         local expprobs,ind = torch.sort(expprobs,2,true)
+         
+         -- print({expprobs[{{},{1}}]-expprobs[{{},{2}}]})
+         -- t = expprobs
+         -- print(t,{t})
+         -- print({margin[{{},{1}}]})
+         margin[{{},{1}}] = (expprobs[{{},{1}}]-expprobs[{{},{2}}])
          entropy[{{},{1}}] = torch.sum(-torch.cmul(logprobs,logprobs:exp()),2)
          valacc[{{},{1}}]:fill(reward)
          states = getstate()
-         ndfoutputs = ndf:forward(states)
+         -- print({states})
+         ndfoutputs = ndf:forward(states:cuda())
          if not unlabeledstates then
             unlabeledstates = states
          else
-            unlabeledstates = torch.cat(unlabeledstates,states)
+            unlabeledstates = torch.cat(unlabeledstates,states,1)
          end
          --filter the batch.
          local filter = torch.ge(ndfoutputs,0.5)
          local oppfilter = torch.lt(ndfoutputs,0.5)
          local oppnum = torch.sum(oppfilter)
          local num = torch.sum(filter)
-         local indx = torch.CudaLongTensor(num)
-         local oppindx = torch.CudaLongTensor(oppnum)
-         local j = 0;
-         for i = 1,opt.activebatchSize do
-            if filter[i] == 1 then
-               j = j + 1
-               indx[j] = i
+         if num>0 then
+            local indx = torch.CudaLongTensor(num)
+            local oppindx = torch.CudaLongTensor(oppnum)
+            local j = 0;
+            for i = 1,opt.activebatchSize do
+               if filter[i] == 1 then
+                  j = j + 1
+                  indx[j] = i
+               end
             end
-         end
-         local j = 0;
-         for i = 1,opt.activebatchSize do
-            if oppfilter[i] == 1 then
-               j = j + 1
-               oppindx[j] = i
+            local j = 0;
+            for i = 1,opt.activebatchSize do
+               if oppfilter[i] == 1 then
+                  j = j + 1
+                  oppindx[j] = i
+               end
             end
-         end
-         collectgarbage()
-         if filtind then
-            filtind = torch.cat(filtind,indx)
-         else
-            filtind = indx
-         end
+            collectgarbage()
+            if filtind then
+               filtind = torch.cat(filtind,indx)
+            else
+               filtind = indx
+            end
+         
          --if filtered batch has length less than opt.activebatchSize then do not train else add it to the training set and start training.
-         if filtind:size(1)>=opt.activebatchSize then
-            local batch = filtind:split(opt.activebatchSize)[1]
-            filtind = filtind:split(opt.activebatchSize)[2]
-            modifiedtrain = torch.cat(modifiedtrain,batch)
-            unlabeledpool = torch.cat(unlabeledpool,oppindx)
-            confusion:zero()
-            model,reward,confusion = trainModel(modifiedtrain,prevalset)
+            if filtind:size(1)>=opt.activebatchSize then
+               local batch = filtind:split(opt.activebatchSize)[1]
+               filtind = filtind:split(opt.activebatchSize)[2]
+               modifiedtrain = torch.cat(modifiedtrain,batch)
+               unlabeledpool = torch.cat(unlabeledpool,oppindx)
+               confusion:zero()
+               model,reward,confusion = trainModel(modifiedtrain,prevalset)
+            end
          end
       end
       --now train the ndf by using unlabeled states.
@@ -264,11 +278,13 @@ function trainNdfReinforce(L)
          local ndfeval =  function(x) 
             if x ~= parametersn then parametersn:copy(x) end
             gradParametersn:zero()
-            local outputs = ndf:forward(unlabeledstates[t])
-            local targets = torch.ge(ndfprobs,0.5)
+            print(t,unlabeledstates)
+            local outputs = ndf:forward(unlabeledstates[t]:cuda())
+            local targets = torch.ge(outputs,0.5):cuda()
+            print({outputs},{targets})
             f = criteriondf:forward(outputs,targets)
             df_do = criteriondf:backward(outputs,targets)
-            ndf:backward(unlabeledstates[t],(reward-baseline)*df_do)
+            ndf:backward(unlabeledstates[t]:cuda(),(reward-baseline)*df_do)
             return f,gradParametersn
          end
          optim.adam(ndfeval,parametersn)
@@ -280,18 +296,22 @@ end
 ---------------------- trainModel function ------------------------------------------------------------------
 --this function takes train dataset, validation dataset and outputs the validation accuracy.
 function trainModel(L,Lval)
+   print('training model...')
    local model = nn.Sequential()
    model:add(nn.Linear(784,500)):add(nn.Tanh()):add(nn.Linear(500,10)):add(nn.LogSoftMax())
    weightinitm(model)
-   --converting the model to cudnn
+
+   -- converting the model to cudnn
    cuda = model:cuda()
    cudnn.convert(model, cudnn)
+
    local parameters,gradParameters = model:getParameters()
    local epochs = math.floor(L:size(1)/trainset:size(1)*500)
    local batchSize = 128
    local reward = 0
    for ep = 1,epochs do
       -- print({L})
+      xlua.progress(ep,epochs)
       local shuffle = torch.randperm(L:size(1)):long()
       batches = L:index(1,shuffle):long():split(batchSize)
       for i = 1 , (#batches)-1 do
@@ -345,7 +365,6 @@ function train()
    unlabeledpool = posttrainsetind
    unlabeledpool = unlabeledpool:split(opt.activebatchSize)
    local modifiedtrain = pretrainsetind
-   print('input to trainmodel1',{modifiedtrain},modifiedtrain:size(1))
    model,reward,confusion = trainModel(modifiedtrain,prevalset)
    trainNdfReinforce(modifiedtrain)
    local unlabeledstates = nil
@@ -411,7 +430,6 @@ function train()
          modifiedtrain = torch.cat(modifiedtrain,batch)
          unlabeledpool = torch.cat(unlabeledpool,oppindx)
          confusion:zero()
-         print('input to trainmodel',{modifiedtrain})
          model,reward,confusion = trainModel(modifiedtrain,prevalset)
       end
       -- for every 10K addition to training set update ndf
